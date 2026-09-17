@@ -40,8 +40,8 @@ def rotate_signature(sig_img, angle):
     return sig_img.rotate(angle, expand=True, resample=Image.BICUBIC)
 
 
-def composite_preview(page_img, sig_img, center_frac, width_frac):
-    base = page_img.convert("RGBA").copy()
+def composite_signature(base, sig_img, center_frac, width_frac):
+    """Alpha-composite sig_img onto base (both RGBA) in place."""
     target_w = max(1, round(width_frac * base.width))
     scale = target_w / sig_img.width
     target_h = max(1, round(sig_img.height * scale))
@@ -50,21 +50,23 @@ def composite_preview(page_img, sig_img, center_frac, width_frac):
     cy = center_frac[1] * base.height
     top_left = (round(cx - target_w / 2), round(cy - target_h / 2))
     base.alpha_composite(resized, dest=top_left)
-    return base.convert("RGB")
 
 
-def build_signed_pdf(pdf_bytes, page_index, sig_img, center_frac, width_frac):
+def build_signed_pdf(pdf_bytes, placements):
+    """placements: list of dicts with page_index, sig_img, center_frac, width_frac."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[page_index]
-    pw, ph = page.rect.width, page.rect.height
-    w_pt = width_frac * pw
-    h_pt = w_pt * (sig_img.height / sig_img.width)
-    cx_pt = center_frac[0] * pw
-    cy_pt = center_frac[1] * ph
-    rect = fitz.Rect(cx_pt - w_pt / 2, cy_pt - h_pt / 2, cx_pt + w_pt / 2, cy_pt + h_pt / 2)
-    buf = io.BytesIO()
-    sig_img.save(buf, format="PNG")
-    page.insert_image(rect, stream=buf.getvalue(), keep_proportion=True)
+    for placement in placements:
+        page = doc[placement["page_index"]]
+        pw, ph = page.rect.width, page.rect.height
+        sig_img = placement["sig_img"]
+        w_pt = placement["width_frac"] * pw
+        h_pt = w_pt * (sig_img.height / sig_img.width)
+        cx_pt = placement["center_frac"][0] * pw
+        cy_pt = placement["center_frac"][1] * ph
+        rect = fitz.Rect(cx_pt - w_pt / 2, cy_pt - h_pt / 2, cx_pt + w_pt / 2, cy_pt + h_pt / 2)
+        buf = io.BytesIO()
+        sig_img.save(buf, format="PNG")
+        page.insert_image(rect, stream=buf.getvalue(), keep_proportion=True)
     out = io.BytesIO()
     doc.save(out)
     doc.close()
@@ -73,75 +75,137 @@ def build_signed_pdf(pdf_bytes, page_index, sig_img, center_frac, width_frac):
 
 st.title("✍️ Sign a PDF")
 st.caption(
-    "Upload a PDF and a signature image, click on the page preview to place it, "
-    "then download the signed file. Nothing leaves your machine."
+    "Upload a PDF and one or more signature images, place each one where you "
+    "like (any page, size, rotation), then download the signed file. "
+    "Nothing leaves your machine."
 )
 
 pdf_file = st.file_uploader("PDF document", type=["pdf"])
-sig_file = st.file_uploader("Signature image", type=["png", "jpg", "jpeg"])
+sig_files = st.file_uploader(
+    "Signature image(s)",
+    type=["png", "jpg", "jpeg"],
+    accept_multiple_files=True,
+)
 
-if pdf_file and sig_file:
+if pdf_file and sig_files:
     pdf_bytes = pdf_file.getvalue()
     doc = load_pdf(pdf_bytes)
     num_pages = len(doc)
 
+    # Stable per-signature key based on upload order + filename.
+    sig_keys = [f"sig_{i}_{f.name}" for i, f in enumerate(sig_files)]
+
+    for key in sig_keys:
+        if key not in st.session_state:
+            st.session_state[key] = {
+                "page": 1,
+                "center": (0.5, 0.5),
+                "width_pct": 20,
+                "rotation": 0,
+                "remove_white": True,
+                "threshold": 235,
+            }
+
+    active_idx = st.selectbox(
+        "Editing signature",
+        options=range(len(sig_files)),
+        format_func=lambda i: sig_files[i].name,
+    )
+    active_key = sig_keys[active_idx]
+    active_file = sig_files[active_idx]
+    state = st.session_state[active_key]
+
     col1, col2 = st.columns(2)
     with col1:
-        page_number = st.number_input(
-            "Page", min_value=1, max_value=num_pages, value=1, step=1
+        state["page"] = st.number_input(
+            "Page",
+            min_value=1,
+            max_value=num_pages,
+            value=state["page"],
+            step=1,
+            key=f"{active_key}_page",
         )
     with col2:
-        width_pct = st.slider("Signature width (% of page width)", 5, 60, 20)
+        state["width_pct"] = st.slider(
+            "Signature width (% of page width)",
+            5,
+            60,
+            state["width_pct"],
+            key=f"{active_key}_width",
+        )
 
-    rotation = st.slider("Rotation (degrees)", -45, 45, 0)
-
-    sig_raw = Image.open(io.BytesIO(sig_file.getvalue()))
-    default_remove_white = sig_raw.mode != "RGBA"
-    remove_white = st.checkbox(
-        "Remove white background from signature", value=default_remove_white
+    state["rotation"] = st.slider(
+        "Rotation (degrees)", -45, 45, state["rotation"], key=f"{active_key}_rotation"
     )
-    threshold = 235
-    if remove_white:
-        threshold = st.slider("White removal sensitivity", 200, 254, 235)
-
-    sig_processed = sig_raw.convert("RGBA")
-    if remove_white:
-        sig_processed = make_transparent(sig_processed, threshold)
-    sig_rotated = rotate_signature(sig_processed, rotation)
-
-    page_index = page_number - 1
-    page, page_img = render_page(doc, page_index)
-
-    center_key = f"center_{page_index}"
-    if center_key not in st.session_state:
-        st.session_state[center_key] = (0.5, 0.5)
-
-    preview = composite_preview(
-        page_img, sig_rotated, st.session_state[center_key], width_pct / 100
+    state["remove_white"] = st.checkbox(
+        "Remove white background from signature",
+        value=state["remove_white"],
+        key=f"{active_key}_removewhite",
     )
+    if state["remove_white"]:
+        state["threshold"] = st.slider(
+            "White removal sensitivity",
+            200,
+            254,
+            state["threshold"],
+            key=f"{active_key}_threshold",
+        )
 
-    st.write("Click anywhere on the page below to move the signature there:")
-    click = streamlit_image_coordinates(preview, key=f"coords_{page_index}")
+    # Process every signature (needed to render all of them onto the preview page).
+    processed_imgs = {}
+    for key, f in zip(sig_keys, sig_files):
+        s = st.session_state[key]
+        raw = Image.open(io.BytesIO(f.getvalue())).convert("RGBA")
+        if s["remove_white"]:
+            raw = make_transparent(raw, s["threshold"])
+        processed_imgs[key] = rotate_signature(raw, s["rotation"])
+
+    preview_page_index = state["page"] - 1
+    page, page_img = render_page(doc, preview_page_index)
+    preview = page_img.convert("RGBA").copy()
+
+    for key, f in zip(sig_keys, sig_files):
+        s = st.session_state[key]
+        if s["page"] - 1 != preview_page_index:
+            continue
+        composite_signature(preview, processed_imgs[key], s["center"], s["width_pct"] / 100)
+
+    st.write(f"Click anywhere on page {state['page']} to move **{active_file.name}** there:")
+    click = streamlit_image_coordinates(
+        preview.convert("RGB"), key=f"coords_{active_key}_{preview_page_index}"
+    )
 
     if click is not None:
         fx = min(max(click["x"] / preview.width, 0.0), 1.0)
         fy = min(max(click["y"] / preview.height, 0.0), 1.0)
-        if (fx, fy) != st.session_state[center_key]:
-            st.session_state[center_key] = (fx, fy)
+        if (fx, fy) != state["center"]:
+            state["center"] = (fx, fy)
             st.rerun()
 
-    if st.button("Reset position to center"):
-        st.session_state[center_key] = (0.5, 0.5)
+    if st.button("Reset this signature's position to center"):
+        state["center"] = (0.5, 0.5)
         st.rerun()
 
+    with st.expander("All placed signatures"):
+        for key, f in zip(sig_keys, sig_files):
+            s = st.session_state[key]
+            marker = "→ " if key == active_key else ""
+            st.write(
+                f"{marker}**{f.name}** — page {s['page']}, "
+                f"{s['width_pct']}% width, rotated {s['rotation']}°"
+            )
+
     if st.button("Generate signed PDF", type="primary"):
-        signed_bytes = build_signed_pdf(
-            pdf_bytes,
-            page_index,
-            sig_rotated,
-            st.session_state[center_key],
-            width_pct / 100,
-        )
+        placements = [
+            {
+                "page_index": st.session_state[key]["page"] - 1,
+                "sig_img": processed_imgs[key],
+                "center_frac": st.session_state[key]["center"],
+                "width_frac": st.session_state[key]["width_pct"] / 100,
+            }
+            for key in sig_keys
+        ]
+        signed_bytes = build_signed_pdf(pdf_bytes, placements)
         st.success("Signed PDF ready.")
         st.download_button(
             "Download signed PDF",
@@ -150,4 +214,4 @@ if pdf_file and sig_file:
             mime="application/pdf",
         )
 else:
-    st.info("Upload both a PDF and a signature image to get started.")
+    st.info("Upload a PDF and at least one signature image to get started.")
